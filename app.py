@@ -1,183 +1,205 @@
 import re
 import requests
 import streamlit as st
+import xml.etree.ElementTree as ET
 
-st.set_page_config(page_title="書籍検索アプリ (openBD)", layout="wide")
+st.set_page_config(page_title="書籍検索アプリ (NDL)", layout="wide")
 
-st.title("書籍検索アプリ")
-st.caption("タイトル検索は Open Library を使い、表紙画像などの詳細は openBD で取得します（登録不要・制限の少ない組み合わせ）。最大5件表示して確定できます。")
+st.title("書籍検索アプリ（国立国会図書館 + openBD）")
+st.caption("NDL SRU で日本語タイトルを検索し、見つかった ISBN を openBD で照会して表紙画像を取得します。登録不要で日本の資料に強い組み合わせです。最大5件表示。")
 
-
-def normalize_isbn(isbn: str) -> str:
-    """ハイフンや空白を削除して ISBN を正規化する（数字とXのみを残す）。"""
-    if not isbn:
-        return ""
-    s = re.sub(r"[^0-9Xx]", "", isbn)
-    return s.upper()
+NDL_SRU_URL = "https://iss.ndl.go.jp/api/sru"
+OPENBD_URL = "https://api.openbd.jp/v1/get"
 
 
-def isbn10_to_isbn13(isbn10: str) -> str:
-    """ISBN-10 を ISBN-13 (978 prefix) に変換する。入力は10文字（チェックディジット含む）。"""
-    isbn10 = normalize_isbn(isbn10)
-    if len(isbn10) != 10:
-        return ""
-    core = isbn10[:-1]
-    isbn13_body = "978" + core
-    # 計算
-    total = 0
-    for i, ch in enumerate(isbn13_body):
-        n = int(ch)
-        total += n if i % 2 == 0 else n * 3
-    check = (10 - (total % 10)) % 10
-    return isbn13_body + str(check)
+def parse_ndl_sru(xml_text: str):
+    """NDL SRU の XML レスポンスをパースし、各 record の title, creator, publisher, identifier(isbn) を抽出します。
+    戻り値はレコードのリスト: [{"title":..., "creator":..., "publisher":..., "identifiers": [..]}, ...]
+    """
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return []
+
+    ns = {
+        "srw": "http://www.loc.gov/zing/srw/",
+        "dc": "http://purl.org/dc/elements/1.1/",
+    }
+    records = []
+    for rec in root.findall(".//{http://www.loc.gov/zing/srw/}record"):
+        data = rec.find("{http://www.loc.gov/zing/srw/}recordData")
+        if data is None:
+            continue
+        # recordData 内の dc:* 要素を直接読む
+        title = None
+        creators = []
+        publishers = []
+        identifiers = []
+        for child in data:
+            tag = child.tag
+            if tag.endswith("}title"):
+                title = (child.text or "").strip()
+            elif tag.endswith("}creator"):
+                if child.text:
+                    creators.append(child.text.strip())
+            elif tag.endswith("}publisher"):
+                if child.text:
+                    publishers.append(child.text.strip())
+            elif tag.endswith("}identifier"):
+                if child.text:
+                    identifiers.append(child.text.strip())
+        records.append({
+            "title": title or "",
+            "creator": ", ".join(creators) if creators else "",
+            "publisher": ", ".join(publishers) if publishers else "",
+            "identifiers": identifiers,
+        })
+    return records
 
 
-def extract_isbn13_from_ol_doc(doc: dict) -> list:
-    """Open Library の検索結果ドキュメントから ISBN13 の候補リストを返す（可能なら変換を行う）。"""
-    isbns = []
-    for raw in doc.get("isbn", []) or []:
-        s = normalize_isbn(raw)
+def extract_isbn13_list(identifiers: list) -> list:
+    """identifier のリストから ISBN 相当の 13 桁を抽出し、正規化して返す。"""
+    res = []
+    for idf in identifiers:
+        if not idf:
+            continue
+        s = re.sub(r"[^0-9Xx]", "", idf)
         if len(s) == 13:
-            isbns.append(s)
+            res.append(s)
         elif len(s) == 10:
-            conv = isbn10_to_isbn13(s)
-            if conv:
-                isbns.append(conv)
-    return isbns
+            # ISBN-10 -> ISBN-13
+            core = s[:-1]
+            isbn13_body = "978" + core
+            total = 0
+            for i, ch in enumerate(isbn13_body):
+                n = int(ch)
+                total += n if i % 2 == 0 else n * 3
+            check = (10 - (total % 10)) % 10
+            res.append(isbn13_body + str(check))
+    return res
 
 
-def search_openlibrary(title: str, limit: int = 20) -> list:
-    """Open Library でタイトル検索し、ISBN13 のリスト（重複なし）を返す。"""
+def query_ndl_by_title(title: str, maximum_records: int = 20):
+    """NDL SRU に title クエリで問い合わせて、パースしたレコードを返す。"""
     if not title:
         return []
-    url = "https://openlibrary.org/search.json"
-    params = {"title": title, "limit": limit}
+    params = {
+        "operation": "searchRetrieve",
+        "query": f'title="{title}"',
+        "maximumRecords": str(maximum_records),
+    }
     try:
-        r = requests.get(url, params=params, timeout=10)
+        r = requests.get(NDL_SRU_URL, params=params, timeout=15)
         r.raise_for_status()
-        data = r.json()
+        data = r.text
     except Exception as e:
-        st.error(f"Open Library 検索でエラーが発生しました: {e}")
+        st.error(f"NDL 検索でエラーが発生しました: {e}")
         return []
-
-    docs = data.get("docs", [])
-    isbn13s = []
-    seen = set()
-    for doc in docs:
-        candidates = extract_isbn13_from_ol_doc(doc)
-        for isbn in candidates:
-            if isbn not in seen:
-                seen.add(isbn)
-                isbn13s.append({
-                    "isbn13": isbn,
-                    "title": doc.get("title") or "",
-                    "author": ", ".join(doc.get("author_name", [])) if doc.get("author_name") else "",
-                    "publisher": ", ".join(doc.get("publisher", [])) if doc.get("publisher") else "",
-                })
-    return isbn13s
+    records = parse_ndl_sru(data)
+    return records
 
 
-def query_openbd(isbn_list: list) -> dict:
-    """openBD に複数 ISBN を渡してメタ情報を取得する。返り値は isbn13 -> openbd_item (or None)。"""
-    if not isbn_list:
+def query_openbd_for_isbns(isbn13_list: list) -> dict:
+    """openBD に ISBN13 のリストを渡してメタ情報を取得。返り値は isbn -> item(or None)。"""
+    if not isbn13_list:
         return {}
-    # openBD はカンマ区切りで複数指定可能
-    isbn_param = ",".join(isbn_list)
-    url = "https://api.openbd.jp/v1/get"
+    isbn_param = ",".join(isbn13_list)
     try:
-        r = requests.get(url, params={"isbn": isbn_param}, timeout=10)
+        r = requests.get(OPENBD_URL, params={"isbn": isbn_param}, timeout=10)
         r.raise_for_status()
         data = r.json()
     except Exception as e:
-        st.error(f"openBD への問い合わせでエラーが発生しました: {e}")
-        return {isbn: None for isbn in isbn_list}
-
-    # openBD はリクエストした順に配列を返す（見つからない項目は null）
+        st.error(f"openBD 問い合わせでエラー: {e}")
+        return {isbn: None for isbn in isbn13_list}
     mapping = {}
-    for i, isbn in enumerate(isbn_list):
+    for i, isbn in enumerate(isbn13_list):
         try:
-            item = data[i]
+            mapping[isbn] = data[i]
         except Exception:
-            item = None
-        mapping[isbn] = item
+            mapping[isbn] = None
     return mapping
 
 
-# セッションステート初期化
+# セッション初期化
 if "results" not in st.session_state:
     st.session_state["results"] = []
 if "confirmed" not in st.session_state:
     st.session_state["confirmed"] = None
 
 with st.form("search_form"):
-    query = st.text_input("本のタイトルを入力してください", "")
+    query = st.text_input("本のタイトル（日本語可）を入力してください", "")
     submitted = st.form_submit_button("検索")
     if submitted:
         st.session_state["confirmed"] = None
         st.session_state["results"] = []
 
-        # 1) Open Library でタイトル検索して ISBN13 候補を収集
-        ol_results = search_openlibrary(query, limit=20)
-        if not ol_results:
-            st.warning("検索結果が見つかりませんでした。別のタイトルで試してください。")
+        ndl_records = query_ndl_by_title(query, maximum_records=30)
+        if not ndl_records:
+            st.warning("該当する結果が見つかりませんでした。別のタイトルで試してください。")
         else:
-            # 2) 最初の候補から最大5個の ISBN を選んで openBD に問い合わせ
-            candidates = ol_results[:20]  # ある程度広く取ってから cover のあるものを優先
-            isbn_list = [c["isbn13"] for c in candidates]
-            # 重複排除して最初の 10 程度を取る
-            seen = set()
-            ordered = []
-            for s in isbn_list:
-                if s not in seen:
-                    seen.add(s)
-                    ordered.append(s)
-                if len(ordered) >= 10:
-                    break
+            # 各レコードから ISBN13 を抽出して優先度をつける
+            candidates = []
+            for rec in ndl_records:
+                isbn13s = extract_isbn13_list(rec.get("identifiers", []))
+                if not isbn13s:
+                    # ISBN が無い場合でもタイトル/creator を候補表示できるようにする
+                    candidates.append({
+                        "isbn13": None,
+                        "title": rec.get("title"),
+                        "author": rec.get("creator"),
+                        "publisher": rec.get("publisher"),
+                        "ndl_raw": rec,
+                    })
+                else:
+                    for i13 in isbn13s:
+                        candidates.append({
+                            "isbn13": i13,
+                            "title": rec.get("title"),
+                            "author": rec.get("creator"),
+                            "publisher": rec.get("publisher"),
+                            "ndl_raw": rec,
+                        })
 
-            # 問い合わせ
-            openbd_map = query_openbd(ordered)
+            # ISBN があるものを先にし、openBD で詳細（表紙）を取る
+            isbn_list = [c["isbn13"] for c in candidates if c["isbn13"]][:20]
+            openbd_map = query_openbd_for_isbns(isbn_list) if isbn_list else {}
 
-            # openBD の情報を優先して候補リストを作成（表紙があるものを前に）
             enriched = []
-            for entry in candidates:
-                isbn = entry["isbn13"]
-                ob = openbd_map.get(isbn)
+            for c in candidates:
+                isbn = c.get("isbn13")
                 cover = None
                 ob_title = None
                 ob_publisher = None
-                if ob:
-                    summary = ob.get("summary", {})
+                if isbn and isbn in openbd_map and openbd_map[isbn]:
+                    summary = openbd_map[isbn].get("summary", {})
                     cover = summary.get("cover")
                     ob_title = summary.get("title")
                     ob_publisher = summary.get("publisher")
-                item = {
-                    "id": isbn,
-                    "title": ob_title or entry.get("title") or "不明",
-                    "authors": entry.get("author") or "不明",
-                    "publisher": ob_publisher or entry.get("publisher") or "不明",
+                enriched.append({
+                    "id": isbn or f"NDL-{len(enriched)}",
+                    "title": ob_title or c.get("title") or "",
+                    "authors": c.get("author") or "",
+                    "publisher": ob_publisher or c.get("publisher") or "",
                     "image": cover,
-                    "raw_openbd": ob,
-                    "raw_ol": entry,
-                }
-                enriched.append(item)
+                    "raw_ndl": c.get("ndl_raw"),
+                    "raw_openbd": openbd_map.get(isbn) if isbn else None,
+                })
 
-            # 表紙があるものを先に、最大5件
+            # 表紙のある順にし、最大5件
             with_cover = [x for x in enriched if x["image"]]
             without = [x for x in enriched if not x["image"]]
             final = (with_cover + without)[:5]
-
             st.session_state["results"] = final
 
-# 検索結果の表示と選択
+# 表示と選択
 if st.session_state["results"]:
     results = st.session_state["results"]
-
     labels = []
     for i, r in enumerate(results):
-        label = f"{i+1}. {r['title']} — 著者: {r['authors']} — 出版社: {r['publisher']} — ISBN13: {r['id']}"
+        label = f"{i+1}. {r['title']} — 著者: {r['authors']} — 出版社: {r['publisher']} — ID: {r['id']}"
         labels.append(label)
 
-    st.subheader("候補（最大5件、openBD の表紙優先）")
+    st.subheader("候補（最大5件、表紙優先表示）")
     selected_label = st.radio("一覧から選んでください", labels, key="choice_radio")
     selected_index = labels.index(selected_label)
     selected = results[selected_index]
@@ -185,18 +207,18 @@ if st.session_state["results"]:
     cols = st.columns([1, 2])
     with cols[0]:
         if selected["image"]:
-            st.image(selected["image"], caption="表紙画像（openBD）", use_column_width=True)
+            st.image(selected["image"], caption="表紙画像", use_column_width=True)
         else:
-            st.info("表紙画像は openBD に見つかりませんでした")
-        st.write("表紙画像のURL:")
+            st.info("表紙画像は見つかりませんでした")
+        st.write("表紙画像URL:")
         st.code(selected["image"] or "取得できませんでした")
 
     with cols[1]:
         st.markdown("### 選択中の書籍（確定前）")
-        st.write("正確なタイトル:", selected["title"])
+        st.write("タイトル:", selected["title"])
         st.write("著者:", selected["authors"])
         st.write("出版社:", selected["publisher"])
-        st.write("ISBN13:", selected["id"])
+        st.write("ID:", selected["id"])
 
     if st.button("確定"):
         st.session_state["confirmed"] = selected
@@ -214,10 +236,9 @@ if st.session_state["confirmed"]:
         else:
             st.info("表紙画像は利用できません")
     with cols2[1]:
-        st.write("正確なタイトル:", confirmed["title"])
+        st.write("タイトル:", confirmed["title"])
         st.write("著者:", confirmed["authors"])
         st.write("出版社:", confirmed["publisher"])
-        st.write("ISBN13:", confirmed["id"])
-        st.write("表紙画像のURL:")
+        st.write("ID:", confirmed["id")
+        st.write("表紙画像URL:")
         st.code(confirmed["image"] or "取得できませんでした")
-        st.write("（必要ならここからコピーして別の処理に渡してください）")
