@@ -3,7 +3,7 @@ import requests
 import streamlit as st
 import xml.etree.ElementTree as ET
 
-st.set_page_config(page_title="書籍検索アプリ (NDL)", layout="wide")
+st.set_page_config(page_title="書籍検索アプリ（NDL）", layout="wide")
 
 st.title("書籍検索アプリ（国立国会図書館 + openBD）")
 st.caption("NDL SRU で日本語タイトルを検索し、見つかった ISBN を openBD で照会して表紙画像を取得します。登録不要で日本の資料に強い組み合わせです。最大5件表示。")
@@ -21,16 +21,11 @@ def parse_ndl_sru(xml_text: str):
     except ET.ParseError:
         return []
 
-    ns = {
-        "srw": "http://www.loc.gov/zing/srw/",
-        "dc": "http://purl.org/dc/elements/1.1/",
-    }
     records = []
     for rec in root.findall(".//{http://www.loc.gov/zing/srw/}record"):
         data = rec.find("{http://www.loc.gov/zing/srw/}recordData")
         if data is None:
             continue
-        # recordData 内の dc:* 要素を直接読む
         title = None
         creators = []
         publishers = []
@@ -67,7 +62,6 @@ def extract_isbn13_list(identifiers: list) -> list:
         if len(s) == 13:
             res.append(s)
         elif len(s) == 10:
-            # ISBN-10 -> ISBN-13
             core = s[:-1]
             isbn13_body = "978" + core
             total = 0
@@ -137,12 +131,10 @@ with st.form("search_form"):
         if not ndl_records:
             st.warning("該当する結果が見つかりませんでした。別のタイトルで試してください。")
         else:
-            # 各レコードから ISBN13 を抽出して優先度をつける
             candidates = []
             for rec in ndl_records:
                 isbn13s = extract_isbn13_list(rec.get("identifiers", []))
                 if not isbn13s:
-                    # ISBN が無い場合でもタイトル/creator を候補表示できるようにする
                     candidates.append({
                         "isbn13": None,
                         "title": rec.get("title"),
@@ -160,7 +152,6 @@ with st.form("search_form"):
                             "ndl_raw": rec,
                         })
 
-            # ISBN があるものを先にし、openBD で詳細（表紙）を取る
             isbn_list = [c["isbn13"] for c in candidates if c["isbn13"]][:20]
             openbd_map = query_openbd_for_isbns(isbn_list) if isbn_list else {}
 
@@ -185,7 +176,6 @@ with st.form("search_form"):
                     "raw_openbd": openbd_map.get(isbn) if isbn else None,
                 })
 
-            # 表紙のある順にし、最大5件
             with_cover = [x for x in enriched if x["image"]]
             without = [x for x in enriched if not x["image"]]
             final = (with_cover + without)[:5]
@@ -239,6 +229,6 @@ if st.session_state["confirmed"]:
         st.write("タイトル:", confirmed["title"])
         st.write("著者:", confirmed["authors"])
         st.write("出版社:", confirmed["publisher"])
-        st.write("ID:", confirmed["id")
+        st.write("ID:", confirmed["id"])
         st.write("表紙画像URL:")
         st.code(confirmed["image"] or "取得できませんでした")
